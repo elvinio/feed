@@ -420,19 +420,30 @@
 
   /* ── Generation ────────────────────────────────────────────────────────── */
 
-  // What each phase of a request means in plain words. `connect` splits on how
-  // long it has been waiting: a few seconds is normal, a minute means the Modal
-  // container is cold and the user deserves to be told rather than left
+  // Summarizes what every currently-in-flight section is doing into one line.
+  // Up to CONCURRENCY sections synthesize at once, so this picks the most
+  // noteworthy shared phase rather than listing each one. `connect` splits on
+  // how long it has been waiting: a few seconds is normal, a minute means the
+  // Modal container is cold and the user deserves to be told rather than left
   // guessing whether anything is happening.
-  function phaseText(phase, waited, bytes) {
-    if (phase === 'connect') {
-      return waited > 12
-        ? 'Waiting for Kokoro to wake up — a cold server can take a minute or two'
-        : 'Contacting Kokoro…';
+  function phaseSummary(active) {
+    const entries = [...active.values()];
+    if (!entries.length) return 'Saving audio…';
+    const retrying = entries.filter(w => w.phase === 'retry').length;
+    if (retrying) return retrying > 1 ? `${retrying} sections failed once — trying again` : 'That section failed once — trying again';
+    if (entries.some(w => w.phase === 'connect' && (Date.now() - w.phaseAt) / 1000 > 12)) {
+      return 'Waiting for Kokoro to wake up — a cold server can take a minute or two';
     }
-    if (phase === 'retry') return 'That section failed once — trying again';
-    if (phase === 'store') return 'Saving audio…';
-    return 'Receiving audio' + (bytes ? ' · ' + fmtBytes(bytes) : '…');
+    const streaming = entries.filter(w => w.phase === 'stream');
+    if (streaming.length) {
+      const bytes = streaming.reduce((a, w) => a + w.bytes, 0);
+      return streaming.length > 1
+        ? `Receiving audio for ${streaming.length} sections · ${fmtBytes(bytes)}`
+        : 'Receiving audio' + (bytes ? ' · ' + fmtBytes(bytes) : '…');
+    }
+    const storing = entries.filter(w => w.phase === 'store').length;
+    if (storing) return storing > 1 ? `Saving audio for ${storing} sections…` : 'Saving audio…';
+    return entries.length > 1 ? `Contacting Kokoro for ${entries.length} sections…` : 'Contacting Kokoro…';
   }
 
   // Generation keeps running when the user navigates away, so anything that
@@ -506,10 +517,13 @@
     const liveDurations = (from && article.audio && article.audio.durations)
       ? article.audio.durations.slice(0, from) : [];
 
-    // `idx` doubles as the index of the section in flight and the count of
-    // sections already stored — they are the same number.
-    const G = { idx: from, phase: 'connect', bytes: 0, chunkBytes: 0,
-                t0: Date.now(), phaseAt: Date.now() };
+    // Up to CONCURRENCY sections are in flight together, each independently
+    // tracked; `committed` is how many sections at the front are done —
+    // TTS.generate only ever advances it over a contiguous prefix, and
+    // onChunk below fires in that same order, however many finish at once.
+    const active = new Map();  // index -> { phase, bytes, phaseAt }
+    let committed = from;
+    const t0 = Date.now();
 
     // Guards every DOM write below: this closure keeps running (and Store
     // keeps getting updated) even if the user navigates to a different
@@ -517,28 +531,35 @@
     // dock the moment it is no longer what is on screen.
     const onScreen = () => State.articleId === article.id;
 
+    const fracFor = (i) => {
+      const w = active.get(i);
+      if (!w) return 0;
+      if (w.phase === 'store') return 1;
+      if (w.phase !== 'stream') return 0;
+      const expect = expectFor(i);
+      return expect > 0 ? Math.min(w.bytes / expect, 0.99) : 0;
+    };
+
     const paint = () => {
       if (!onScreen()) return;
-      const i = Math.min(G.idx, total - 1);
-      const expect = expectFor(i);
-      const frac = (G.phase === 'stream' && expect > 0)
-        ? Math.min(G.chunkBytes / expect, 0.99)
-        : (G.phase === 'store' ? 1 : 0);
-      const pct = Math.round(((doneWeight + weights[i] * frac) / totalWeight) * 100);
+      let runningFrac = 0;
+      for (const i of active.keys()) runningFrac += weights[i] * fracFor(i);
+      const pct = Math.round(((doneWeight + runningFrac) / totalWeight) * 100);
 
-      $('gen-label').textContent = `Section ${i + 1} of ${total} · ${pct}%`;
+      const activeIdx = [...active.keys()].sort((a, b) => a - b);
+      $('gen-label').textContent = activeIdx.length > 1
+        ? `Sections ${activeIdx.map(i => i + 1).join(', ')} of ${total} · ${pct}%`
+        : `Section ${(activeIdx.length ? activeIdx[0] : Math.min(committed, total - 1)) + 1} of ${total} · ${pct}%`;
       for (let k = 0; k < total; k++) {
         const seg = $('gen-seg-' + k);
         if (!seg) continue;
-        seg.classList.toggle('active', k === G.idx);
-        seg.classList.toggle('waiting', k === G.idx && (G.phase === 'connect' || G.phase === 'retry'));
-        seg.firstElementChild.style.width =
-          (k < G.idx ? 100 : k === G.idx ? Math.round(frac * 100) : 0) + '%';
+        const w = active.get(k);
+        seg.classList.toggle('active', !!w);
+        seg.classList.toggle('waiting', !!w && (w.phase === 'connect' || w.phase === 'retry'));
+        seg.firstElementChild.style.width = (k < committed ? 100 : w ? Math.round(fracFor(k) * 100) : 0) + '%';
       }
       $('gen-segs').setAttribute('aria-valuenow', String(pct));
-      $('gen-sub').textContent =
-        phaseText(G.phase, (Date.now() - G.phaseAt) / 1000, G.bytes) +
-        ' · ' + fmtTime((Date.now() - G.t0) / 1000) + ' elapsed';
+      $('gen-sub').textContent = phaseSummary(active) + ' · ' + fmtTime((Date.now() - t0) / 1000) + ' elapsed';
     };
 
     // Repaint on a timer as well as on events: the elapsed clock is the one
@@ -559,15 +580,18 @@
       await TTS.generate(article, {
         voice: s.voice, speed, format: s.format, signal: ctrl.signal, from,
         onPhase: (i, phase) => {
-          G.idx = i; G.phase = phase; G.phaseAt = Date.now();
-          if (phase === 'connect' || phase === 'retry') G.chunkBytes = 0;
+          let w = active.get(i);
+          if (!w) { w = { phase, bytes: 0, phaseAt: Date.now() }; active.set(i, w); }
+          else { w.phase = phase; w.phaseAt = Date.now(); }
+          if (phase === 'connect' || phase === 'retry') w.bytes = 0;
           paint();
         },
-        onBytes: (soFar, inChunk) => { G.bytes = soFar; G.chunkBytes = inChunk; paintSoon(); },
+        onBytes: (i, n) => { const w = active.get(i); if (w) w.bytes = n; paintSoon(); },
         onChunk: (i, n, blob, duration) => {
+          active.delete(i);
+          committed = i + 1;
           seenBytes += blob.size; seenChars += weights[i];
           doneWeight += weights[i];
-          G.idx = i + 1; G.chunkBytes = 0;
           liveDurations[i] = duration;
           if (onScreen()) {
             applyDurations(liveDurations.slice());
@@ -582,8 +606,13 @@
       const cancelled = e.name === 'AbortError';
       const msg = cancelled ? 'Generation cancelled.' : (e.message || 'Generation failed.');
       // A toast is gone in three seconds; a failure the user needs to act on
-      // stays in the dock until the next run.
-      if (!cancelled) State.genError = `Section ${G.idx + 1} of ${total} failed — ${msg}`;
+      // stays in the dock until the next run. TTS.generate tags the error
+      // with which section actually failed — several can be in flight at
+      // once, so `committed` alone would not say which one.
+      if (!cancelled) {
+        const idx = e.chunkIndex !== undefined ? e.chunkIndex : committed;
+        State.genError = `Section ${idx + 1} of ${total} failed — ${msg}`;
+      }
       toast(msg);
     } finally {
       clearInterval(tick);
