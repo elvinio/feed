@@ -71,6 +71,17 @@ what finished playable (the dock then offers to finish the rest). Chunks record
 the paragraph range they cover, which is what drives the reading-pane highlight
 and tap-a-paragraph-to-seek.
 
+**Synthesis progress.** A single request can run for minutes — Kokoro on Modal
+is CPU-only, and a cold container boots torch before it answers — so the dock
+reports where it actually is: one bar segment per section (widths proportional
+to section length), a fill inside the running segment estimated from bytes
+received, the current phase in words (*contacting* → *waiting for a cold start*
+→ *receiving audio*), and an elapsed clock that keeps ticking as the liveness
+cue. `reader-tts.js` also watchdogs each request — `WAIT_MS` for the response
+headers, `STALL_MS` between audio chunks — so a dead connection fails with a
+description instead of hanging on one section forever. The failure stays in the
+dock until the next run rather than vanishing with the toast.
+
 **Playback.** Per-chunk durations are measured once after synthesis, so the
 player presents a single continuous timeline across every chunk — seeking,
 ±15 s and the progress bar all work across chunk boundaries. Position is

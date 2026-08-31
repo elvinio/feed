@@ -73,6 +73,7 @@
     speed: 1,            // desired speed (see SPEEDS)
     seeking: false,
     gen: null,           // AbortController while synthesizing
+    genError: '',        // last synthesis failure, shown in the dock until the next run
     saveTimer: 0,
   };
 
@@ -283,6 +284,7 @@
     State.durations = [];
     State.offsets = [];
     State.total = 0;
+    State.genError = '';
 
     $('view-library').hidden = true;
     $('view-article').hidden = false;
@@ -354,10 +356,20 @@
     if (!generating && !ready) {
       const s = Store.getSettings();
       const est = TTS.estimateSeconds(article.text, State.speed);
+      const n = State.chunks.length;
       $('btn-generate').textContent = Store.isConfigured() ? 'Generate speech' : 'Add your Kokoro URL & key';
-      $('dock-gen-meta').innerHTML = Store.isConfigured()
-        ? `${State.chunks.length} section${State.chunks.length === 1 ? '' : 's'} · about ${fmtTime(est)} · ${esc(TTS.voiceLabel(s.voice))} at ${State.speed}×`
+      // The section count is the first thing users ask about, so the tooltip
+      // answers it where it is shown.
+      $('dock-gen-meta').title = Store.isConfigured()
+        ? `Long text is synthesized in ${n} separate request${n === 1 ? '' : 's'}, split at paragraph breaks. `
+          + 'The first section is playable while the rest are still being made, and a failure only costs one section.'
+        : '';
+      const meta = Store.isConfigured()
+        ? `${n} section${n === 1 ? '' : 's'} · about ${fmtTime(est)} · ${esc(TTS.voiceLabel(s.voice))} at ${State.speed}×`
         : 'Settings → Kokoro TTS URL and API key.';
+      $('dock-gen-meta').innerHTML = State.genError
+        ? `<span class="gen-err">${esc(State.genError)}</span><br>${meta}`
+        : meta;
     }
 
     if (ready) renderPlayer(article);
@@ -372,6 +384,7 @@
 
     const audio = article.audio;
     const notes = [];
+    if (State.genError) notes.push(`<span class="gen-err">${esc(State.genError)}</span>`);
     if (audio.partial) {
       notes.push(`Only ${audio.count} of ${State.chunks.length} sections were synthesized. <button class="link" id="note-resume">Finish the rest</button>`);
     }
@@ -386,6 +399,22 @@
   }
 
   /* ── Generation ────────────────────────────────────────────────────────── */
+
+  // What each phase of a request means in plain words. `connect` splits on how
+  // long it has been waiting: a few seconds is normal, a minute means the Modal
+  // container is cold and the user deserves to be told rather than left
+  // guessing whether anything is happening.
+  function phaseText(phase, waited, bytes) {
+    if (phase === 'connect') {
+      return waited > 12
+        ? 'Waiting for Kokoro to wake up — a cold server can take a minute or two'
+        : 'Contacting Kokoro…';
+    }
+    if (phase === 'retry') return 'That section failed once — trying again';
+    if (phase === 'store') return 'Saving audio…';
+    return 'Receiving audio' + (bytes ? ' · ' + fmtBytes(bytes) : '…');
+  }
+
   async function startGeneration({ from = 0 } = {}) {
     const article = Store.getArticle(State.articleId);
     if (!article) return;
@@ -395,23 +424,89 @@
     stopPlayback();
     const s = Store.getSettings();
     const speed = State.speed;
-    const total = State.chunks.length;
+    const chunks = State.chunks;
+    const total = chunks.length;
     const ctrl = new AbortController();
     State.gen = ctrl;
+    State.genError = '';
     renderDock();
 
-    let done = from;
-    const paint = (bytes) => {
-      $('gen-label').textContent = `Section ${Math.min(done + 1, total)} of ${total}` + (bytes ? ` · ${fmtBytes(bytes)}` : '');
-      $('gen-bar').style.width = Math.round((done / total) * 100) + '%';
+    // Weight the overall bar by section length so a long section does not
+    // advance it as much as a short one.
+    const weights = chunks.map(c => c.text.length);
+    const totalWeight = weights.reduce((a, b) => a + b, 0) || 1;
+    let doneWeight = 0;
+    for (let i = 0; i < from; i++) doneWeight += weights[i];
+
+    $('gen-segs').innerHTML = chunks.map((c, i) =>
+      `<div class="gen-seg" id="gen-seg-${i}" style="flex:${weights[i]}"><div class="gen-seg-fill"></div></div>`).join('');
+
+    // Progress *inside* the running request is estimated from bytes received.
+    // The first section has only the nominal bitrate to go on; once a section
+    // has landed we know what this article actually encodes to per character,
+    // which is a much better predictor for the rest.
+    let seenBytes = 0, seenChars = 0;
+    const expectFor = (i) => (seenChars
+      ? weights[i] * (seenBytes / seenChars)
+      : TTS.expectedBytes(chunks[i].text, speed, s.format));
+
+    // `idx` doubles as the index of the section in flight and the count of
+    // sections already stored — they are the same number.
+    const G = { idx: from, phase: 'connect', bytes: 0, chunkBytes: 0,
+                t0: Date.now(), phaseAt: Date.now() };
+
+    const paint = () => {
+      const i = Math.min(G.idx, total - 1);
+      const expect = expectFor(i);
+      const frac = (G.phase === 'stream' && expect > 0)
+        ? Math.min(G.chunkBytes / expect, 0.99)
+        : (G.phase === 'store' ? 1 : 0);
+      const pct = Math.round(((doneWeight + weights[i] * frac) / totalWeight) * 100);
+
+      $('gen-label').textContent = `Section ${i + 1} of ${total} · ${pct}%`;
+      for (let k = 0; k < total; k++) {
+        const seg = $('gen-seg-' + k);
+        if (!seg) continue;
+        seg.classList.toggle('active', k === G.idx);
+        seg.classList.toggle('waiting', k === G.idx && (G.phase === 'connect' || G.phase === 'retry'));
+        seg.firstElementChild.style.width =
+          (k < G.idx ? 100 : k === G.idx ? Math.round(frac * 100) : 0) + '%';
+      }
+      $('gen-segs').setAttribute('aria-valuenow', String(pct));
+      $('gen-sub').textContent =
+        phaseText(G.phase, (Date.now() - G.phaseAt) / 1000, G.bytes) +
+        ' · ' + fmtTime((Date.now() - G.t0) / 1000) + ' elapsed';
     };
-    paint(0);
+
+    // Repaint on a timer as well as on events: the elapsed clock is the one
+    // thing that keeps moving while a slow request is in flight, and it is what
+    // tells the user the run is alive rather than wedged.
+    const tick = setInterval(paint, 1000);
+    // Stream reads can arrive far faster than the screen needs updating.
+    let lastPaint = 0;
+    const paintSoon = () => {
+      const now = Date.now();
+      if (now - lastPaint < 100) return;
+      lastPaint = now;
+      paint();
+    };
+    paint();
 
     try {
       const res = await TTS.generate(article, {
         voice: s.voice, speed, format: s.format, signal: ctrl.signal, from,
-        onBytes: paint,
-        onChunk: (i) => { done = i + 1; paint(0); },
+        onPhase: (i, phase) => {
+          G.idx = i; G.phase = phase; G.phaseAt = Date.now();
+          if (phase === 'connect' || phase === 'retry') G.chunkBytes = 0;
+          paint();
+        },
+        onBytes: (soFar, inChunk) => { G.bytes = soFar; G.chunkBytes = inChunk; paintSoon(); },
+        onChunk: (i, n, blob) => {
+          seenBytes += blob.size; seenChars += weights[i];
+          doneWeight += weights[i];
+          G.idx = i + 1; G.chunkBytes = 0;
+          paint();
+        },
       });
       const durations = await TTS.measureDurations(article.id, res.count);
       Store.markAudio(article.id, {
@@ -421,17 +516,23 @@
       Store.updateArticle(article.id, { audio: Object.assign({}, Store.getArticle(article.id).audio, { partial: false }) });
       toast('Audio ready.');
     } catch (e) {
+      const cancelled = e.name === 'AbortError';
       // Whatever finished before the failure stays playable.
-      if (done > 0) {
-        const durations = await TTS.measureDurations(article.id, done);
+      if (G.idx > 0) {
+        const durations = await TTS.measureDurations(article.id, G.idx);
         Store.markAudio(article.id, {
-          count: done, voice: s.voice, speed, format: s.format,
+          count: G.idx, voice: s.voice, speed, format: s.format,
           bytes: 0, durations,
         });
         Store.updateArticle(article.id, { audio: Object.assign({}, Store.getArticle(article.id).audio, { partial: true }) });
       }
-      toast(e.name === 'AbortError' ? 'Generation cancelled.' : (e.message || 'Generation failed.'));
+      const msg = cancelled ? 'Generation cancelled.' : (e.message || 'Generation failed.');
+      // A toast is gone in three seconds; a failure the user needs to act on
+      // stays in the dock until the next run.
+      if (!cancelled) State.genError = `Section ${G.idx + 1} of ${total} failed — ${msg}`;
+      toast(msg);
     } finally {
+      clearInterval(tick);
       State.gen = null;
       const fresh = Store.getArticle(State.articleId);
       if (fresh) { State.speed = speed; await loadDurations(fresh); }

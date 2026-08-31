@@ -30,6 +30,20 @@ const TTS = (function () {
   const MAX_CHUNK = 1400;
   const MIN_CHUNK = 400;
 
+  // Watchdogs. Without them a stalled request hangs forever: `fetch` only
+  // carries the caller's Cancel signal, so a dead connection is indist-
+  // inguishable from slow synthesis — the dock just sits on one section with
+  // no error and no retry. Both budgets are deliberately generous, because a
+  // cold Modal container has to boot torch + kokoro before it answers at all.
+  const WAIT_MS  = 240000;   // request sent → response headers
+  const STALL_MS = 90000;    // gap between two audio chunks mid-stream
+
+  // Encoder bitrates, mirroring the ffmpeg settings in `tts/tts.py`. They turn
+  // "bytes received so far" into a position inside the current section, which
+  // is what makes the progress bar move continuously rather than once per
+  // request.
+  const BYTES_PER_SEC = { mp3: 128000 / 8, opus: 48000 / 8 };
+
   /* ── Voice catalog ─────────────────────────────────────────────────────── */
   // Kokoro ships a fixed set of voices — there is no catalog endpoint.
   const VOICES = [
@@ -187,62 +201,110 @@ const TTS = (function () {
   function wordCount(text) { return (text.trim().match(/\S+/g) || []).length; }
   // ~150 wpm at 1×; the synthesis speed scales it directly.
   function estimateSeconds(text, speed) { return wordCount(text) / 150 * 60 / (speed || 1); }
+  // Roughly how many bytes this text should encode to — a rough number is fine,
+  // callers use it only to place a progress bar inside one request.
+  function expectedBytes(text, speed, format) {
+    return estimateSeconds(text, speed) * (BYTES_PER_SEC[format] || BYTES_PER_SEC.mp3);
+  }
 
   /* ── One synthesis request ─────────────────────────────────────────────── */
-  async function synthesize(text, { voice, speed, format, signal, onProgress } = {}) {
+  /* `onPhase(phase)` reports where the request is: 'connect' while waiting for
+     response headers (a cold container can sit here for a minute), then
+     'stream' once audio is actually arriving. `onProgress(bytes)` fires per
+     stream read. Both exist so the UI can say what is happening instead of
+     showing one frozen line for the whole request. */
+  async function synthesize(text, { voice, speed, format, signal, onProgress, onPhase } = {}) {
     const s = Store.getSettings();
     const base = Store.ttsBase();
     const key = s.kokoroKey.trim();
     if (!base) throw new Error('No Kokoro URL. Add it in Settings.');
     if (!key) throw new Error('No Kokoro API key. Add it in Settings.');
 
-    const res = await fetch(base + '/tts', {
-      method: 'POST',
-      headers: { 'X-API-Key': key, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        text,
-        voice: voice || s.voice,
-        format: format || s.format,
-        speed: speed || s.speed,
-      }),
-      signal,
-    });
+    // A private controller lets a watchdog abort the fetch. The caller's signal
+    // is forwarded into it so Cancel keeps working, and `stalled` remembers
+    // which watchdog fired so the abort can be reported as a real error rather
+    // than being mistaken for a user cancellation.
+    const ctrl = new AbortController();
+    const relay = () => ctrl.abort();
+    if (signal) {
+      if (signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+      signal.addEventListener('abort', relay);
+    }
+    let timer = 0, stalled = '';
+    const watch = (ms, why) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { stalled = why; ctrl.abort(); }, ms);
+    };
 
-    if (!res.ok) {
-      let detail = '';
-      try {
-        const j = await res.json();
-        detail = typeof j.detail === 'string' ? j.detail : (j.detail && j.detail.message) || '';
-      } catch (e) {
-        detail = (await res.text().catch(() => '')).slice(0, 200);
+    try {
+      if (onPhase) onPhase('connect');
+      watch(WAIT_MS, 'Kokoro did not respond within ' + Math.round(WAIT_MS / 1000) +
+                     's — the server may be asleep or unreachable.');
+
+      const res = await fetch(base + '/tts', {
+        method: 'POST',
+        headers: { 'X-API-Key': key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text,
+          voice: voice || s.voice,
+          format: format || s.format,
+          speed: speed || s.speed,
+        }),
+        signal: ctrl.signal,
+      });
+
+      if (!res.ok) {
+        let detail = '';
+        try {
+          const j = await res.json();
+          detail = typeof j.detail === 'string' ? j.detail : (j.detail && j.detail.message) || '';
+        } catch (e) {
+          detail = (await res.text().catch(() => '')).slice(0, 200);
+        }
+        if (res.status === 401) detail = detail || 'Invalid or missing API key';
+        throw new Error('Kokoro ' + res.status + (detail ? ': ' + detail : ''));
       }
-      if (res.status === 401) detail = detail || 'Invalid or missing API key';
-      throw new Error('Kokoro ' + res.status + (detail ? ': ' + detail : ''));
-    }
 
-    // Read the stream so the connection stays alive through a long synthesis
-    // and the caller can show bytes arriving instead of a frozen UI.
-    const mime = res.headers.get('content-type') || (format === 'opus' ? 'audio/ogg' : 'audio/mpeg');
-    const reader = res.body.getReader();
-    const parts = [];
-    let received = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      parts.push(value);
-      received += value.length;
-      if (onProgress) onProgress(received);
+      // Read the stream so the connection stays alive through a long synthesis
+      // and the caller can show bytes arriving instead of a frozen UI. The
+      // watchdog is re-armed per read: the budget is the gap between two audio
+      // chunks, not the length of the whole synthesis.
+      const mime = res.headers.get('content-type') || (format === 'opus' ? 'audio/ogg' : 'audio/mpeg');
+      const reader = res.body.getReader();
+      const parts = [];
+      let received = 0;
+      if (onPhase) onPhase('stream');
+      for (;;) {
+        watch(STALL_MS, 'Kokoro stopped sending audio for ' + Math.round(STALL_MS / 1000) + 's.');
+        const { done, value } = await reader.read();
+        if (done) break;
+        parts.push(value);
+        received += value.length;
+        if (onProgress) onProgress(received);
+      }
+      clearTimeout(timer);
+      const blob = new Blob(parts, { type: mime });
+      if (!blob.size) throw new Error('Kokoro returned no audio.');
+      return blob;
+    } catch (e) {
+      // Our own abort surfaces as a described failure; a user Cancel stays an
+      // AbortError so callers can tell the two apart.
+      if (e.name === 'AbortError' && stalled && !(signal && signal.aborted)) throw new Error(stalled);
+      throw e;
+    } finally {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', relay);
     }
-    const blob = new Blob(parts, { type: mime });
-    if (!blob.size) throw new Error('Kokoro returned no audio.');
-    return blob;
   }
 
   /* ── Whole-article synthesis ───────────────────────────────────────────── */
   /* Synthesizes every chunk in order, storing each Blob as it lands so a
      cancelled or failed run still leaves the finished sections playable.
-     `onChunk(index, total, blob)` fires after each chunk is stored. */
-  async function generate(article, { voice, speed, format, signal, onChunk, onBytes, from = 0 } = {}) {
+     `onChunk(index, total, blob)` fires after each chunk is stored;
+     `onBytes(totalSoFar, thisChunkSoFar)` on every stream read; and
+     `onPhase(index, phase, attempt)` on each change of what the run is doing
+     ('connect' | 'stream' | 'retry' | 'store'). */
+  async function generate(article, { voice, speed, format, signal, onChunk, onBytes, onPhase, from = 0 } = {}) {
     const chunks = buildChunks(article.text);
     if (!chunks.length) throw new Error('This article has no text to speak.');
 
@@ -253,17 +315,24 @@ const TTS = (function () {
 
     for (let i = from; i < chunks.length; i++) {
       if (signal && signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+      const opts = {
+        voice, speed, format, signal,
+        onProgress: n => onBytes && onBytes(bytes + n, n),
+        onPhase: p => onPhase && onPhase(i, p),
+      };
       let blob;
       try {
-        blob = await synthesize(chunks[i].text, { voice, speed, format, signal, onProgress: n => onBytes && onBytes(bytes + n) });
+        blob = await synthesize(chunks[i].text, opts);
       } catch (e) {
         if (e.name === 'AbortError') throw e;
         // One retry: Modal cold starts and transient 5xx are common enough that
         // failing the whole article on a first blip would be needlessly brittle.
         if (signal && signal.aborted) throw new DOMException('Cancelled', 'AbortError');
-        blob = await synthesize(chunks[i].text, { voice, speed, format, signal, onProgress: n => onBytes && onBytes(bytes + n) });
+        if (onPhase) onPhase(i, 'retry');
+        blob = await synthesize(chunks[i].text, opts);
       }
       bytes += blob.size;
+      if (onPhase) onPhase(i, 'store');
       await Store.putAudio(article.id, i, blob);
       if (onChunk) onChunk(i, chunks.length, blob);
     }
@@ -295,5 +364,5 @@ const TTS = (function () {
   }
 
   return { VOICES, voiceLabel, buildChunks, paragraphs, sentences, wordCount, estimateSeconds,
-           synthesize, generate, measureDurations, MAX_CHUNK };
+           expectedBytes, synthesize, generate, measureDurations, MAX_CHUNK };
 })();
