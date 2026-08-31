@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#16181d">
+<title>Reader</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Reader">
+<link rel="stylesheet" href="reader.css">
+</head>
+<body>
+
+<!-- ═══ Library ═══════════════════════════════════════════════════════════ -->
+<section id="view-library" class="view">
+  <header class="topbar">
+    <h1>Reader</h1>
+    <div class="topbar-actions">
+      <button class="icon-btn" id="btn-settings" title="Settings" aria-label="Settings">⚙</button>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <div id="library-empty" class="empty" hidden>
+      <p class="empty-title">Nothing saved yet</p>
+      <p class="empty-sub">Paste an article and it stays on this device — text in local storage, audio in IndexedDB.</p>
+    </div>
+    <ul id="library-list" class="cards"></ul>
+  </main>
+
+  <button class="fab" id="btn-new" title="New article" aria-label="New article">+</button>
+</section>
+
+<!-- ═══ Article ═══════════════════════════════════════════════════════════ -->
+<section id="view-article" class="view" hidden>
+  <header class="topbar">
+    <button class="icon-btn" id="btn-back" title="Back" aria-label="Back">←</button>
+    <h1 id="article-title-bar" class="topbar-title"></h1>
+    <div class="topbar-actions">
+      <button class="icon-btn" id="btn-article-menu" title="More" aria-label="More">⋯</button>
+    </div>
+  </header>
+
+  <main class="wrap reading" id="article-body"></main>
+
+  <!-- Sticky audio dock -->
+  <div id="dock" class="dock">
+    <div id="dock-gen" class="dock-gen">
+      <button class="btn primary" id="btn-generate">Generate speech</button>
+      <div class="dock-gen-meta" id="dock-gen-meta"></div>
+    </div>
+
+    <div id="dock-progress" class="dock-progress" hidden>
+      <div class="gen-row">
+        <div class="gen-label" id="gen-label">Synthesizing…</div>
+        <button class="btn ghost sm" id="btn-cancel-gen">Cancel</button>
+      </div>
+      <div class="bar"><div class="bar-fill" id="gen-bar"></div></div>
+    </div>
+
+    <div id="dock-player" class="dock-player" hidden>
+      <div class="seek">
+        <span class="time" id="time-cur">0:00</span>
+        <input type="range" id="seek" min="0" max="1000" value="0" step="1" aria-label="Seek">
+        <span class="time" id="time-dur">0:00</span>
+      </div>
+      <div class="transport">
+        <button class="icon-btn" id="btn-back15" title="Back 15s" aria-label="Back 15 seconds">↺15</button>
+        <button class="icon-btn" id="btn-prev" title="Previous section" aria-label="Previous section">⏮</button>
+        <button class="play-btn" id="btn-play" aria-label="Play">▶</button>
+        <button class="icon-btn" id="btn-next" title="Next section" aria-label="Next section">⏭</button>
+        <button class="icon-btn" id="btn-fwd15" title="Forward 15s" aria-label="Forward 15 seconds">15↻</button>
+      </div>
+      <div class="speeds" id="speeds"></div>
+      <div class="dock-note" id="dock-note"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ Modal host ════════════════════════════════════════════════════════ -->
+<div id="modal-backdrop" class="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <h2 id="modal-title"></h2>
+      <button class="icon-btn" id="modal-close" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="reader-store.js"></script>
+<script src="reader-tts.js"></script>
+<script src="reader-app.js"></script>
+</body>
+</html>
