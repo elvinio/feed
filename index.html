@@ -55,10 +55,12 @@
 
     <div id="dock-progress" class="dock-progress" hidden>
       <div class="gen-row">
-        <div class="gen-label" id="gen-label">Synthesizing…</div>
+        <div class="gen-label" id="gen-label">Starting…</div>
         <button class="btn ghost sm" id="btn-cancel-gen">Cancel</button>
       </div>
-      <div class="bar"><div class="bar-fill" id="gen-bar"></div></div>
+      <!-- One segment per section, widths proportional to section length. -->
+      <div class="gen-segs" id="gen-segs" role="progressbar" aria-label="Synthesis progress" aria-valuemin="0" aria-valuemax="100"></div>
+      <div class="gen-sub" id="gen-sub"></div>
     </div>
 
     <div id="dock-player" class="dock-player" hidden>
