@@ -298,20 +298,25 @@ const TTS = (function () {
   }
 
   /* ── Whole-article synthesis ───────────────────────────────────────────── */
-  /* Synthesizes every chunk in order, storing each Blob as it lands so a
-     cancelled or failed run still leaves the finished sections playable.
-     `onChunk(index, total, blob)` fires after each chunk is stored;
-     `onBytes(totalSoFar, thisChunkSoFar)` on every stream read; and
+  /* Synthesizes every chunk in order, storing each Blob as it lands and
+     updating `article.audio` (via Store.markAudio) after every single chunk —
+     not just at the end. That is what makes the run resumable from the right
+     place even after an ungraceful stop (tab closed, crash), not only an
+     explicit Cancel: `article.audio.count` always matches what is actually in
+     IndexedDB. `onChunk(index, total, blob, duration)` fires after each chunk
+     is stored; `onBytes(totalSoFar, thisChunkSoFar)` on every stream read; and
      `onPhase(index, phase, attempt)` on each change of what the run is doing
-     ('connect' | 'stream' | 'retry' | 'store'). */
+     ('connect' | 'stream' | 'retry' | 'store').
+     `from` > 0 resumes a run that stopped part-way; only a fresh run (from 0)
+     discards what is already stored. */
   async function generate(article, { voice, speed, format, signal, onChunk, onBytes, onPhase, from = 0 } = {}) {
     const chunks = buildChunks(article.text);
     if (!chunks.length) throw new Error('This article has no text to speak.');
 
-    // `from` > 0 resumes a run that was cancelled part-way; only a fresh run
-    // discards what is already stored.
+    const prior = (from && article.audio) || null;
     if (!from) await Store.clearAudio(article.id);
-    let bytes = 0;
+    const durations = prior ? (prior.durations || []).slice(0, from) : [];
+    let bytes = prior ? (prior.bytes || 0) : 0;
 
     for (let i = from; i < chunks.length; i++) {
       if (signal && signal.aborted) throw new DOMException('Cancelled', 'AbortError');
@@ -334,7 +339,20 @@ const TTS = (function () {
       bytes += blob.size;
       if (onPhase) onPhase(i, 'store');
       await Store.putAudio(article.id, i, blob);
-      if (onChunk) onChunk(i, chunks.length, blob);
+      const duration = await blobDuration(blob);
+      durations.push(duration);
+      // Storing the blob and measuring it aren't abort-aware, so a stop
+      // requested during either can land after both finish; re-check before
+      // publishing this chunk so a cancel that raced the store doesn't
+      // resurrect `article.audio` (e.g. right after an edit nulled it out to
+      // discard stale audio). The blob itself stays in IndexedDB, inert and
+      // unreferenced, until the next clearAudio.
+      if (signal && signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+      Store.markAudio(article.id, {
+        count: i + 1, voice, speed, format, bytes, durations: durations.slice(),
+        partial: i + 1 < chunks.length,
+      });
+      if (onChunk) onChunk(i, chunks.length, blob, duration);
     }
     return { count: chunks.length, bytes, chunks };
   }

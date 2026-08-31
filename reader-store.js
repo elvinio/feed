@@ -99,10 +99,14 @@ const Store = (function () {
   }
 
   // Record what the stored audio actually is, so the UI can tell when the
-  // cached audio no longer matches the current voice/speed settings.
-  function markAudio(id, { count, voice, speed, format, bytes, durations }) {
+  // cached audio no longer matches the current voice/speed settings. Called
+  // after every chunk during synthesis (not just at the end), so `count`
+  // always matches what is actually in IndexedDB — a run that stops
+  // ungracefully (tab closed, crash) still leaves an accurate record to
+  // resume from, not just an explicit Cancel.
+  function markAudio(id, { count, voice, speed, format, bytes, durations, partial }) {
     return updateArticle(id, {
-      audio: { count, voice, speed, format, bytes, durations, generatedAt: Date.now() },
+      audio: { count, voice, speed, format, bytes, durations, partial: !!partial, generatedAt: Date.now() },
     });
   }
 

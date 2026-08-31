@@ -73,7 +73,11 @@
     speed: 1,            // desired speed (see SPEEDS)
     seeking: false,
     gen: null,           // AbortController while synthesizing
+    genArticleId: null,  // which article `gen` belongs to — generation keeps
+                          // running if the user browses elsewhere meanwhile
     genError: '',        // last synthesis failure, shown in the dock until the next run
+    awaitingChunk: false, // playback ended at the last synthesized section and
+                           // more of the article is still to come
     saveTimer: 0,
   };
 
@@ -177,6 +181,7 @@
             // The audio no longer matches the words on screen. Dropping it is
             // the honest option — stale audio read against edited text is worse
             // than no audio.
+            abortGenerationFor(existing.id);
             Store.clearAudio(existing.id);
             Store.clearProgress(existing.id);
             Store.updateArticle(existing.id, { audio: null });
@@ -345,13 +350,19 @@
   function renderDock() {
     const article = Store.getArticle(State.articleId);
     if (!article) return;
-    const generating = !!State.gen;
+    // "generating" means *this* article is the one in flight — a background
+    // run for a different article (started before the user navigated away
+    // from it) must not make this dock look busy.
+    const generating = !!(State.gen && State.genArticleId === State.articleId);
     const audio = article.audio;
     const ready = !!(audio && audio.count);
 
     $('dock-progress').hidden = !generating;
     $('dock-gen').hidden = generating || ready;
-    $('dock-player').hidden = generating || !ready;
+    // Unlike dock-progress, the player is not gated on "not generating": the
+    // whole point is that the first section is playable while the rest are
+    // still being made.
+    $('dock-player').hidden = !ready;
 
     if (!generating && !ready) {
       const s = Store.getSettings();
@@ -372,10 +383,10 @@
         : meta;
     }
 
-    if (ready) renderPlayer(article);
+    if (ready) renderPlayer(article, generating);
   }
 
-  function renderPlayer(article) {
+  function renderPlayer(article, generating) {
     $('speeds').innerHTML = SPEEDS.map(v =>
       `<button class="speed${v === State.speed ? ' active' : ''}" data-rate="${v}">${v}×</button>`).join('');
     $('speeds').querySelectorAll('.speed').forEach(b => {
@@ -385,14 +396,23 @@
     const audio = article.audio;
     const notes = [];
     if (State.genError) notes.push(`<span class="gen-err">${esc(State.genError)}</span>`);
-    if (audio.partial) {
-      notes.push(`Only ${audio.count} of ${State.chunks.length} sections were synthesized. <button class="link" id="note-resume">Finish the rest</button>`);
-    }
-    if (State.speed !== audio.speed) {
-      notes.push(`Audio was synthesized at ${audio.speed}× and is being played at ${State.speed}×. <button class="link" id="note-regen">Regenerate at ${State.speed}×</button> for the most natural voice.`);
+    if (generating) {
+      // The progress panel above already explains what is happening; this
+      // just accounts for why playback paused instead of moving on.
+      if (State.awaitingChunk) notes.push('Paused — waiting for the next section to finish…');
+    } else {
+      if (audio.partial) {
+        notes.push(`Only ${audio.count} of ${State.chunks.length} sections were synthesized. ` +
+          `<button class="link" id="note-resume">Finish the rest</button> · ` +
+          `<button class="link" id="note-restart">Start over</button>`);
+      }
+      if (State.speed !== audio.speed) {
+        notes.push(`Audio was synthesized at ${audio.speed}× and is being played at ${State.speed}×. <button class="link" id="note-regen">Regenerate at ${State.speed}×</button> for the most natural voice.`);
+      }
     }
     $('dock-note').innerHTML = notes.join('<br>');
     if ($('note-resume')) $('note-resume').onclick = () => startGeneration({ from: audio.count });
+    if ($('note-restart')) $('note-restart').onclick = () => startGeneration({ from: 0 });
     if ($('note-regen')) $('note-regen').onclick = () => startGeneration({ from: 0 });
 
     updateTransport();
@@ -415,20 +435,50 @@
     return 'Receiving audio' + (bytes ? ' · ' + fmtBytes(bytes) : '…');
   }
 
+  // Generation keeps running when the user navigates away, so anything that
+  // deletes or invalidates an article's audio needs to stop a run targeting
+  // it first — otherwise a chunk landing after the delete would resurrect it.
+  function abortGenerationFor(articleId) {
+    if (State.gen && State.genArticleId === articleId) State.gen.abort();
+  }
+
   async function startGeneration({ from = 0 } = {}) {
     const article = Store.getArticle(State.articleId);
     if (!article) return;
     if (!Store.isConfigured()) return openSettings();
-    if (State.gen) return;
+    if (State.gen) {
+      // Only one generation runs at a time, but it keeps running if the user
+      // wanders off to another article — say so instead of silently no-oping.
+      // The other article can be mid-delete (aborted but not yet cleared) and
+      // briefly gone from Store already, hence the generic fallback.
+      let msg = 'Already generating this article.';
+      if (State.genArticleId !== article.id) {
+        const other = Store.getArticle(State.genArticleId);
+        msg = other ? `Still generating "${other.title}" — try again once it finishes.`
+          : 'Still finishing another generation — try again in a moment.';
+      }
+      toast(msg);
+      return;
+    }
 
-    stopPlayback();
+    if (!from) {
+      // Starting over discards whatever is already stored (TTS.generate wipes
+      // the IndexedDB blobs), so drop the stale pointer to it immediately too
+      // rather than leaving the player showing soon-to-be-deleted audio until
+      // the first new chunk lands.
+      stopPlayback();
+      Store.updateArticle(article.id, { audio: null });
+      State.idx = 0; State.durations = []; State.offsets = []; State.total = 0;
+    }
     const s = Store.getSettings();
     const speed = State.speed;
     const chunks = State.chunks;
     const total = chunks.length;
     const ctrl = new AbortController();
     State.gen = ctrl;
+    State.genArticleId = article.id;
     State.genError = '';
+    State.awaitingChunk = false;
     renderDock();
 
     // Weight the overall bar by section length so a long section does not
@@ -450,12 +500,25 @@
       ? weights[i] * (seenBytes / seenChars)
       : TTS.expectedBytes(chunks[i].text, speed, s.format));
 
+    // Duration of every section made so far, seeded from what a resume
+    // already has, so the player's timeline can grow live as new sections
+    // land instead of only being computed once the whole run finishes.
+    const liveDurations = (from && article.audio && article.audio.durations)
+      ? article.audio.durations.slice(0, from) : [];
+
     // `idx` doubles as the index of the section in flight and the count of
     // sections already stored — they are the same number.
     const G = { idx: from, phase: 'connect', bytes: 0, chunkBytes: 0,
                 t0: Date.now(), phaseAt: Date.now() };
 
+    // Guards every DOM write below: this closure keeps running (and Store
+    // keeps getting updated) even if the user navigates to a different
+    // article or back to the library, but it must stop touching the shared
+    // dock the moment it is no longer what is on screen.
+    const onScreen = () => State.articleId === article.id;
+
     const paint = () => {
+      if (!onScreen()) return;
       const i = Math.min(G.idx, total - 1);
       const expect = expectFor(i);
       const frac = (G.phase === 'stream' && expect > 0)
@@ -493,7 +556,7 @@
     paint();
 
     try {
-      const res = await TTS.generate(article, {
+      await TTS.generate(article, {
         voice: s.voice, speed, format: s.format, signal: ctrl.signal, from,
         onPhase: (i, phase) => {
           G.idx = i; G.phase = phase; G.phaseAt = Date.now();
@@ -501,31 +564,22 @@
           paint();
         },
         onBytes: (soFar, inChunk) => { G.bytes = soFar; G.chunkBytes = inChunk; paintSoon(); },
-        onChunk: (i, n, blob) => {
+        onChunk: (i, n, blob, duration) => {
           seenBytes += blob.size; seenChars += weights[i];
           doneWeight += weights[i];
           G.idx = i + 1; G.chunkBytes = 0;
+          liveDurations[i] = duration;
+          if (onScreen()) {
+            applyDurations(liveDurations.slice());
+            continueIfAwaiting(i);
+            renderDock();
+          }
           paint();
         },
       });
-      const durations = await TTS.measureDurations(article.id, res.count);
-      Store.markAudio(article.id, {
-        count: res.count, voice: s.voice, speed, format: s.format,
-        bytes: res.bytes, durations,
-      });
-      Store.updateArticle(article.id, { audio: Object.assign({}, Store.getArticle(article.id).audio, { partial: false }) });
       toast('Audio ready.');
     } catch (e) {
       const cancelled = e.name === 'AbortError';
-      // Whatever finished before the failure stays playable.
-      if (G.idx > 0) {
-        const durations = await TTS.measureDurations(article.id, G.idx);
-        Store.markAudio(article.id, {
-          count: G.idx, voice: s.voice, speed, format: s.format,
-          bytes: 0, durations,
-        });
-        Store.updateArticle(article.id, { audio: Object.assign({}, Store.getArticle(article.id).audio, { partial: true }) });
-      }
       const msg = cancelled ? 'Generation cancelled.' : (e.message || 'Generation failed.');
       // A toast is gone in three seconds; a failure the user needs to act on
       // stays in the dock until the next run.
@@ -534,25 +588,35 @@
     } finally {
       clearInterval(tick);
       State.gen = null;
-      const fresh = Store.getArticle(State.articleId);
-      if (fresh) { State.speed = speed; await loadDurations(fresh); }
-      renderDock();
+      State.genArticleId = null;
+      if (onScreen()) {
+        const fresh = Store.getArticle(article.id);
+        if (fresh) { State.speed = speed; await loadDurations(fresh); }
+        renderDock();
+      }
     }
   }
 
-  async function loadDurations(article) {
-    const audio = article.audio;
-    if (!audio || !audio.count) { State.durations = []; State.offsets = []; State.total = 0; return; }
-    let durations = audio.durations;
-    if (!durations || durations.length !== audio.count || durations.some(d => !d)) {
-      durations = await TTS.measureDurations(article.id, audio.count);
-      Store.updateArticle(article.id, { audio: Object.assign({}, audio, { durations }) });
-    }
+  // Turns per-chunk durations into the cumulative offsets the player needs
+  // for one continuous timeline. Called both after a bulk measurement and
+  // live, once per chunk, while generation is in progress.
+  function applyDurations(durations) {
     State.durations = durations;
     State.offsets = [];
     let acc = 0;
     durations.forEach(d => { State.offsets.push(acc); acc += d; });
     State.total = acc;
+  }
+
+  async function loadDurations(article) {
+    const audio = article.audio;
+    if (!audio || !audio.count) { applyDurations([]); return; }
+    let durations = audio.durations;
+    if (!durations || durations.length !== audio.count || durations.some(d => !d)) {
+      durations = await TTS.measureDurations(article.id, audio.count);
+      Store.updateArticle(article.id, { audio: Object.assign({}, audio, { durations }) });
+    }
+    applyDurations(durations);
   }
 
   /* ── Player ────────────────────────────────────────────────────────────── */
@@ -566,9 +630,20 @@
     document.body.appendChild(a);
     a.onended = () => {
       const article = Store.getArticle(State.articleId);
-      const last = article && article.audio ? article.audio.count - 1 : 0;
-      if (State.idx < last) loadChunk(State.idx + 1, 0, true);
-      else { Store.clearProgress(State.articleId); updateTransport(); }
+      const count = article && article.audio ? article.audio.count : 0;
+      if (State.idx + 1 < count) { loadChunk(State.idx + 1, 0, true); return; }
+      if (State.idx + 1 < State.chunks.length) {
+        // Caught up to the last section made so far, but this is not the end
+        // of the article — hold position rather than treating it as one.
+        // continueIfAwaiting() resumes automatically once the next section
+        // lands, if it is still being made.
+        State.awaitingChunk = true;
+        updateTransport();
+        renderDock();
+        return;
+      }
+      Store.clearProgress(State.articleId);
+      updateTransport();
     };
     a.ontimeupdate = () => { if (!State.seeking) { updateTransport(); saveProgressThrottled(); } };
     a.onplay = () => { updateTransport(); setMediaState(); };
@@ -586,7 +661,18 @@
     audioEl().playbackRate = State.speed / baked;
   }
 
+  // If playback was paused at the synthesized frontier waiting for `landedIdx`
+  // to land, and it just did, continue seamlessly instead of leaving the user
+  // to notice and press play again.
+  function continueIfAwaiting(landedIdx) {
+    if (State.awaitingChunk && landedIdx === State.idx + 1) {
+      State.awaitingChunk = false;
+      loadChunk(landedIdx, 0, true);
+    }
+  }
+
   async function loadChunk(idx, time, autoplay) {
+    State.awaitingChunk = false;
     const blob = await Store.getAudio(State.articleId, idx);
     if (!blob) { toast('Section ' + (idx + 1) + ' has no audio yet.'); return; }
     const a = audioEl();
@@ -634,6 +720,8 @@
   function seekTo(globalTime, autoplay) {
     const t = Math.max(0, Math.min(globalTime, State.total || 0));
     const { idx, time } = locate(t);
+    const wasAwaiting = State.awaitingChunk;
+    State.awaitingChunk = false;
     const a = audioEl();
     const playing = autoplay !== undefined ? autoplay : !a.paused;
     if (idx === State.idx && a.src) {
@@ -641,6 +729,7 @@
       if (playing) a.play().catch(() => {});
       updateTransport();
       highlight(idx);
+      if (wasAwaiting) renderDock();
     } else {
       loadChunk(idx, time, playing);
     }
@@ -651,7 +740,7 @@
     Store.saveSettings({ speed: rate });
     applyRate();
     const article = Store.getArticle(State.articleId);
-    if (article) renderPlayer(article);
+    if (article) renderPlayer(article, !!(State.gen && State.genArticleId === State.articleId));
   }
 
   function updateTransport() {
@@ -680,6 +769,7 @@
     if (State.audio) { State.audio.pause(); State.audio.removeAttribute('src'); State.audio.load(); }
     if (State.objUrl) { URL.revokeObjectURL(State.objUrl); State.objUrl = null; }
     clearTimeout(State.saveTimer); State.saveTimer = 0;
+    State.awaitingChunk = false;
   }
 
   /* ── Lock-screen / headset controls ────────────────────────────────────── */
@@ -720,6 +810,7 @@
       if ($('m-regen')) $('m-regen').onclick = () => { closeModal(); startGeneration({ from: 0 }); };
       if ($('m-drop')) $('m-drop').onclick = async () => {
         closeModal();
+        abortGenerationFor(article.id);
         stopPlayback();
         await Store.clearAudio(article.id);
         Store.clearProgress(article.id);
@@ -729,6 +820,7 @@
       $('m-del').onclick = async () => {
         if (!confirm('Delete “' + article.title + '” and its audio?')) return;
         closeModal();
+        abortGenerationFor(article.id);
         await Store.deleteArticle(article.id);
         go('#');
         showLibrary();
