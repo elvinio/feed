@@ -38,6 +38,10 @@ const TTS = (function () {
   const WAIT_MS  = 240000;   // request sent → response headers
   const STALL_MS = 90000;    // gap between two audio chunks mid-stream
 
+  // The Kokoro server accepts up to 3 requests at once, so synthesis fetches
+  // this many sections in parallel rather than one at a time.
+  const CONCURRENCY = 3;
+
   // Encoder bitrates, mirroring the ffmpeg settings in `tts/tts.py`. They turn
   // "bytes received so far" into a position inside the current section, which
   // is what makes the progress bar move continuously rather than once per
@@ -298,44 +302,117 @@ const TTS = (function () {
   }
 
   /* ── Whole-article synthesis ───────────────────────────────────────────── */
-  /* Synthesizes every chunk in order, storing each Blob as it lands so a
-     cancelled or failed run still leaves the finished sections playable.
-     `onChunk(index, total, blob)` fires after each chunk is stored;
-     `onBytes(totalSoFar, thisChunkSoFar)` on every stream read; and
-     `onPhase(index, phase, attempt)` on each change of what the run is doing
-     ('connect' | 'stream' | 'retry' | 'store'). */
+  /* Synthesizes up to CONCURRENCY sections in parallel (a pool of workers each
+     pulling the next untried index), storing each Blob as it lands. Sections
+     can finish out of order, but `article.audio` (via Store.markAudio) is
+     only ever advanced over a *contiguous* prefix — section i is published
+     only once every section before it is already published — so `count`
+     always means "sections 0..count-1 are done", exactly like the old
+     one-at-a-time version. That is what every caller (resuming, the player,
+     the progress UI) is built on, and what keeps a run resumable from the
+     right place even after an ungraceful stop (tab closed, crash), not only
+     an explicit Cancel.
+     `onChunk(index, total, blob, duration)` fires once per section, in that
+     same publish order, however many finished concurrently just before it;
+     `onBytes(index, bytesSoFarInThatSection)` on every stream read; and
+     `onPhase(index, phase)` on each change of what that section's request is
+     doing ('connect' | 'stream' | 'retry' | 'store') — several indices can be
+     mid-phase at once.
+     `from` > 0 resumes a run that stopped part-way; only a fresh run (from 0)
+     discards what is already stored. A section beyond `from` can already be
+     sitting in IndexedDB (synthesized but never published, e.g. two sections
+     of a 3-wide batch landed before an ungraceful stop killed the third) —
+     that is reused instead of re-fetched, but only when this run's
+     voice/speed/format match what the already-committed prefix was made
+     with, so a resume after changing a setting can't silently republish a
+     stale-voice section under the new run's metadata. */
   async function generate(article, { voice, speed, format, signal, onChunk, onBytes, onPhase, from = 0 } = {}) {
     const chunks = buildChunks(article.text);
     if (!chunks.length) throw new Error('This article has no text to speak.');
 
-    // `from` > 0 resumes a run that was cancelled part-way; only a fresh run
-    // discards what is already stored.
+    const prior = (from && article.audio) || null;
     if (!from) await Store.clearAudio(article.id);
-    let bytes = 0;
+    const durations = prior ? (prior.durations || []).slice(0, from) : [];
+    let bytes = prior ? (prior.bytes || 0) : 0;
+    const reusable = !prior || (prior.voice === voice && prior.speed === speed && prior.format === format);
 
-    for (let i = from; i < chunks.length; i++) {
-      if (signal && signal.aborted) throw new DOMException('Cancelled', 'AbortError');
-      const opts = {
-        voice, speed, format, signal,
-        onProgress: n => onBytes && onBytes(bytes + n, n),
-        onPhase: p => onPhase && onPhase(i, p),
-      };
-      let blob;
-      try {
-        blob = await synthesize(chunks[i].text, opts);
-      } catch (e) {
-        if (e.name === 'AbortError') throw e;
-        // One retry: Modal cold starts and transient 5xx are common enough that
-        // failing the whole article on a first blip would be needlessly brittle.
-        if (signal && signal.aborted) throw new DOMException('Cancelled', 'AbortError');
-        if (onPhase) onPhase(i, 'retry');
-        blob = await synthesize(chunks[i].text, opts);
+    let nextFetch = from;
+    let nextPublish = from;
+    const finished = new Map();  // index -> { blob, duration }, awaiting publish
+    let firstError = null;
+
+    // Publishes every section that is ready, in order, starting from
+    // `nextPublish` — a burst if several finished while an earlier one was
+    // still in flight. Synchronous throughout (Store.markAudio is a
+    // localStorage write, onChunk is a plain callback), so two workers
+    // finishing "at once" can never double-publish or interleave.
+    function publishReady() {
+      while (finished.has(nextPublish)) {
+        const { blob, duration } = finished.get(nextPublish);
+        finished.delete(nextPublish);
+        bytes += blob.size;
+        durations.push(duration);
+        Store.markAudio(article.id, {
+          count: nextPublish + 1, voice, speed, format, bytes, durations: durations.slice(),
+          partial: nextPublish + 1 < chunks.length,
+        });
+        if (onChunk) onChunk(nextPublish, chunks.length, blob, duration);
+        nextPublish++;
       }
-      bytes += blob.size;
-      if (onPhase) onPhase(i, 'store');
-      await Store.putAudio(article.id, i, blob);
-      if (onChunk) onChunk(i, chunks.length, blob);
     }
+
+    async function worker() {
+      for (;;) {
+        if ((signal && signal.aborted) || firstError) return;
+        const i = nextFetch++;
+        if (i >= chunks.length) return;
+        try {
+          let blob = reusable ? await Store.getAudio(article.id, i) : null;
+          if (!blob) {
+            const opts = {
+              voice, speed, format, signal,
+              onProgress: n => onBytes && onBytes(i, n),
+              onPhase: p => onPhase && onPhase(i, p),
+            };
+            try {
+              blob = await synthesize(chunks[i].text, opts);
+            } catch (e) {
+              if (e.name === 'AbortError') throw e;
+              // One retry: Modal cold starts and transient 5xx are common
+              // enough that failing the whole article on a first blip would
+              // be needlessly brittle.
+              if (signal && signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+              if (onPhase) onPhase(i, 'retry');
+              blob = await synthesize(chunks[i].text, opts);
+            }
+            if (onPhase) onPhase(i, 'store');
+            await Store.putAudio(article.id, i, blob);
+          }
+          const duration = await blobDuration(blob);
+          // Storing/measuring aren't abort-aware, so a stop requested during
+          // either can land after both finish; re-check before publishing so
+          // a cancel that raced the store doesn't resurrect `article.audio`
+          // (e.g. right after an edit nulled it out to discard stale audio).
+          if (signal && signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+          finished.set(i, { blob, duration });
+          publishReady();
+        } catch (e) {
+          if (e.name === 'AbortError') return;   // signal.aborted; every worker winds down
+          // Keep the *lowest* failing index, not just the first to arrive:
+          // that is the one actually blocking the contiguous prefix (and
+          // what a resume would retry first), regardless of which of several
+          // concurrent failures happened to error out sooner.
+          if (!firstError || i < firstError.chunkIndex) { e.chunkIndex = i; firstError = e; }
+          return;
+        }
+      }
+    }
+
+    const poolSize = Math.max(0, Math.min(CONCURRENCY, chunks.length - from));
+    await Promise.all(Array.from({ length: poolSize }, worker));
+
+    if (signal && signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+    if (firstError) throw firstError;
     return { count: chunks.length, bytes, chunks };
   }
 

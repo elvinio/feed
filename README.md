@@ -64,28 +64,48 @@ No build step, no bundler, no framework — plain `<script src>` files sharing a
 global scope, in the same style as the `health` repo's PWAs.
 
 **Chunking.** An article is split into ~1400-character chunks that never break
-mid-sentence, and each chunk is one `/tts` request. This is what makes the app
-feel responsive: section 1 is stored while the rest are still baking, a failed
-chunk costs one retry rather than the whole article, and a cancelled run leaves
-what finished playable (the dock then offers to finish the rest). Chunks record
-the paragraph range they cover, which is what drives the reading-pane highlight
-and tap-a-paragraph-to-seek.
+mid-sentence, and each chunk is one `/tts` request. Up to `CONCURRENCY` (3)
+sections synthesize at once — that's what the Kokoro server can take — via a
+small worker pool in `TTS.generate`; sections can finish out of order, but
+`article.audio.count` only ever advances over a contiguous prefix (section i
+publishes only once every section before it already has), so resuming, the
+player, and the progress UI all still see "sections 0..count-1 are done,"
+exactly as if they ran one at a time. This is what makes the app feel
+responsive: section 1 is playable — the player appears and starts — while the
+rest are still baking, and a failed chunk costs one retry rather than the
+whole article. `article.audio` (what says how many sections exist) is updated
+after *every* published chunk, not just at the end, so however a run stops —
+an explicit Cancel, a failed request, the tab closing, the app crashing — the
+next visit sees exactly what actually finished and the dock offers to
+**finish the rest** from there. A **start over** option sits right next to it
+for a clean redo (also reachable any time from the article's ⋯ menu, e.g. to
+regenerate at a new speed). While more sections are being made, playback that
+catches up to the last one made so far pauses and continues on its own the
+moment the next section lands, rather than treating it as the end of the
+article. Chunks record the paragraph range they cover, which is what drives
+the reading-pane highlight and tap-a-paragraph-to-seek.
 
 **Synthesis progress.** A single request can run for minutes — Kokoro on Modal
 is CPU-only, and a cold container boots torch before it answers — so the dock
 reports where it actually is: one bar segment per section (widths proportional
-to section length), a fill inside the running segment estimated from bytes
-received, the current phase in words (*contacting* → *waiting for a cold start*
-→ *receiving audio*), and an elapsed clock that keeps ticking as the liveness
-cue. `reader-tts.js` also watchdogs each request — `WAIT_MS` for the response
+to section length), a fill inside each *running* segment estimated from bytes
+received — several segments can be filling at once, one per section currently
+in flight — the current phase in words (*contacting* → *waiting for a cold
+start* → *receiving audio*, summarized across whichever sections are active
+right now), and an elapsed clock that keeps ticking as the liveness cue.
+`reader-tts.js` also watchdogs each request — `WAIT_MS` for the response
 headers, `STALL_MS` between audio chunks — so a dead connection fails with a
 description instead of hanging on one section forever. The failure stays in the
-dock until the next run rather than vanishing with the toast.
+dock until the next run rather than vanishing with the toast; sections already
+in flight alongside a failed one are left to finish rather than cut short.
 
-**Playback.** Per-chunk durations are measured once after synthesis, so the
-player presents a single continuous timeline across every chunk — seeking,
-±15 s and the progress bar all work across chunk boundaries. Position is
-remembered per article, and Media Session wires up the lock-screen controls.
+**Playback.** Per-chunk durations are measured as each chunk lands (not just
+once at the end), so the player presents a single continuous timeline that
+grows live while synthesis is still running — seeking, ±15 s and the progress
+bar all work across chunk boundaries from section 1 onward. Generation keeps
+running even if you back out to the library or open a different article;
+only one article generates at a time. Position is remembered per article, and
+Media Session wires up the lock-screen controls.
 
 ## Storage
 
