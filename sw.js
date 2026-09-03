@@ -1,7 +1,7 @@
 /* Service worker for the Reader PWA.
    IMPORTANT: bump CACHE whenever any file in ASSETS changes, or installed
    clients keep being served the previous version. */
-const CACHE = 'reader-v4';
+const CACHE = 'reader-v5';
 
 const ASSETS = [
   './',

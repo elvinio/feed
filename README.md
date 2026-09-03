@@ -107,6 +107,16 @@ running even if you back out to the library or open a different article;
 only one article generates at a time. Position is remembered per article, and
 Media Session wires up the lock-screen controls.
 
+Moving from one section to the next is the seam where a listening session is
+most easily lost, so it is kept short and loud. The section after the one
+playing is read out of IndexedDB while there is still audio in hand, which
+means the handoff in `ended` is synchronous — a new `src` and a `play()` in
+that one event, with no `await` in between for a throttled background tab or a
+mobile autoplay policy to refuse. When a `play()` *is* refused, or a section
+will not decode, or the audio cannot be read back at all, playback parks with
+a note in the dock and a toast instead of stopping silently: pressing play
+picks it up where it left off.
+
 ## Storage
 
 | Key | Contents |

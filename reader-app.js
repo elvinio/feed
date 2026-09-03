@@ -78,6 +78,13 @@
     genError: '',        // last synthesis failure, shown in the dock until the next run
     awaitingChunk: false, // playback ended at the last synthesized section and
                            // more of the article is still to come
+    next: null,          // { idx, url } — the section after the one playing,
+                          // read out of IndexedDB ahead of time so a handoff
+                          // needs no await (see loadChunk)
+    loadSeq: 0,          // bumped by every load; an await that comes back
+                          // holding a stale token has been superseded
+    blocked: false,      // a play() the browser refused — the session is
+                          // stopped and needs a tap, not a silent dead end
     saveTimer: 0,
   };
 
@@ -396,6 +403,7 @@
     const audio = article.audio;
     const notes = [];
     if (State.genError) notes.push(`<span class="gen-err">${esc(State.genError)}</span>`);
+    if (State.blocked) notes.push('Playback stopped here — press play to carry on.');
     if (generating) {
       // The progress panel above already explains what is happening; this
       // just accounts for why playback paused instead of moving on.
@@ -595,7 +603,9 @@
           liveDurations[i] = duration;
           if (onScreen()) {
             applyDurations(liveDurations.slice());
-            continueIfAwaiting(i);
+            // The player may be part-way through the section before this
+            // one: have it ready so that handoff is as seamless as any other.
+            if (!continueIfAwaiting(i)) prefetch(State.idx + 1);
             renderDock();
           }
           paint();
@@ -671,15 +681,75 @@
         renderDock();
         return;
       }
+      releaseNext();
       Store.clearProgress(State.articleId);
       updateTransport();
     };
     a.ontimeupdate = () => { if (!State.seeking) { updateTransport(); saveProgressThrottled(); } };
-    a.onplay = () => { updateTransport(); setMediaState(); };
+    a.onplay = () => {
+      if (State.blocked) { State.blocked = false; renderDock(); }
+      updateTransport();
+      setMediaState();
+    };
     a.onpause = () => updateTransport();
-    a.onerror = () => toast('Could not play this section.');
+    a.onerror = () => {
+      // stopPlayback() clears src, which some browsers report as an error;
+      // that is teardown, not a failure to play.
+      if (!a.getAttribute('src')) return;
+      // A section that will not decode ends the run here; say so, because the
+      // alternative is a player that just stops with nothing on screen.
+      stall('Section ' + (State.idx + 1) + ' could not be played.');
+    };
     State.audio = a;
     return a;
+  }
+
+  // Every play() in the app goes through here. A rejected play() is the single
+  // failure that used to end a listening session dead — a background tab, a
+  // mobile autoplay policy, or a section swap the browser declined to follow
+  // would reject it and the old `.catch(() => {})` threw that away, leaving a
+  // paused player and no explanation. Say what happened so a tap resumes.
+  function requestPlay(a) {
+    const p = a.play();
+    if (!p || !p.catch) return;
+    p.catch((e) => {
+      // An interrupted play() is routine: a newer load or an immediate pause
+      // superseded it, and whatever superseded it owns what happens next.
+      if (e && e.name === 'AbortError') return;
+      stall('Playback stopped — tap play to continue.');
+    });
+  }
+
+  // Playback cannot continue on its own. Park it visibly rather than silently.
+  function stall(msg) {
+    State.blocked = true;
+    toast(msg);
+    updateTransport();
+    renderDock();
+  }
+
+  function releaseNext() {
+    if (State.next) { URL.revokeObjectURL(State.next.url); State.next = null; }
+  }
+
+  // Reads the section after the one playing out of IndexedDB while there is
+  // still audio in hand, so the handoff in `ended` has a blob URL waiting and
+  // can run start to finish inside that one event.
+  async function prefetch(idx) {
+    if (State.next && State.next.idx === idx) return;
+    const seq = State.loadSeq;
+    const articleId = State.articleId;
+    const article = Store.getArticle(articleId);
+    const count = article && article.audio ? article.audio.count : 0;
+    if (idx < 0 || idx >= count) return;
+    let blob;
+    try { blob = await Store.getAudio(articleId, idx); } catch (e) { return; }
+    // The player moved on while we were reading — a seek, another article —
+    // so this is no longer the section that comes next.
+    if (!blob || articleId !== State.articleId || seq !== State.loadSeq) return;
+    if (State.next && State.next.idx === idx) return;
+    releaseNext();
+    State.next = { idx, url: URL.createObjectURL(blob) };
   }
 
   // playbackRate is *relative* to the speed baked into the audio, so selecting
@@ -694,32 +764,79 @@
   // to land, and it just did, continue seamlessly instead of leaving the user
   // to notice and press play again.
   function continueIfAwaiting(landedIdx) {
-    if (State.awaitingChunk && landedIdx === State.idx + 1) {
-      State.awaitingChunk = false;
-      loadChunk(landedIdx, 0, true);
-    }
+    if (!State.awaitingChunk || landedIdx !== State.idx + 1) return false;
+    State.awaitingChunk = false;
+    loadChunk(landedIdx, 0, true);
+    return true;
   }
 
   async function loadChunk(idx, time, autoplay) {
     State.awaitingChunk = false;
-    const blob = await Store.getAudio(State.articleId, idx);
+    // The section after the one playing is normally already in hand, which is
+    // what makes a transition synchronous. Anything else — the first play, a
+    // seek — reads it now.
+    if (State.next && State.next.idx === idx) {
+      const url = State.next.url;
+      State.next = null;
+      swapTo(idx, url, time, autoplay);
+      return;
+    }
+    const seq = ++State.loadSeq;
+    const articleId = State.articleId;
+    let blob;
+    try {
+      blob = await Store.getAudio(articleId, idx);
+    } catch (e) {
+      // The read itself failed (storage evicted, private-mode quota, a
+      // browser that froze the tab mid-transaction). This used to reject
+      // unhandled and take the session down with it.
+      stall('Could not read the audio for section ' + (idx + 1) + '.');
+      return;
+    }
+    // A newer load started, or the user left, while this one was reading:
+    // finishing now would fight whatever replaced it.
+    if (seq !== State.loadSeq || articleId !== State.articleId) return;
     if (!blob) { toast('Section ' + (idx + 1) + ' has no audio yet.'); return; }
+    swapTo(idx, URL.createObjectURL(blob), time, autoplay);
+  }
+
+  // The synchronous half of loading a section: everything from "the audio is
+  // in hand" onwards. Split out from the IndexedDB read above so that moving
+  // from one section to the next runs to completion inside the `ended` event,
+  // with no await in the middle for a throttled tab or an autoplay policy to
+  // refuse. Takes ownership of `url`.
+  function swapTo(idx, url, time, autoplay) {
+    State.loadSeq++;              // any load still awaiting is now stale
+    State.awaitingChunk = false;
+    State.blocked = false;
     const a = audioEl();
-    if (State.objUrl) URL.revokeObjectURL(State.objUrl);
-    State.objUrl = URL.createObjectURL(blob);
+    const prev = State.objUrl;
+    State.objUrl = url;
     State.idx = idx;
-    a.src = State.objUrl;
-    applyRate();
-    const start = () => {
-      if (time) { try { a.currentTime = time; } catch (e) { /* metadata not in yet */ } }
-      applyRate();
-      if (autoplay) a.play().catch(() => {});
-      updateTransport();
-    };
-    if (a.readyState >= 1) start();
-    else a.onloadedmetadata = start;
+    a.onloadedmetadata = null;    // never let an earlier load's handler fire
+    a.src = url;
+    applyRate();                  // a load resets playbackRate to 1
+    // Resuming part-way into a section has to wait for metadata before it can
+    // seek; starting one at 0 does not, so it plays in this same turn.
+    if (time) {
+      const start = () => {
+        a.onloadedmetadata = null;
+        try { a.currentTime = time; } catch (e) { /* metadata not in yet */ }
+        applyRate();
+        if (autoplay) requestPlay(a);
+        updateTransport();
+      };
+      if (a.readyState >= 1) start();
+      else a.onloadedmetadata = start;
+    } else if (autoplay) {
+      requestPlay(a);
+    }
+    // Safe now: setting src above already stopped the previous fetch.
+    if (prev && prev !== url) URL.revokeObjectURL(prev);
+    updateTransport();
     highlight(idx);
     if (autoplay) scrollToChunk(idx);
+    prefetch(idx + 1);
   }
 
   function togglePlay() {
@@ -729,7 +846,7 @@
       loadChunk(p ? p.idx : 0, p ? p.time : 0, true);
       return;
     }
-    if (a.paused) a.play().catch(() => {}); else a.pause();
+    if (a.paused) requestPlay(a); else a.pause();
   }
 
   // Global time across all chunks → (chunk, offset within chunk).
@@ -755,7 +872,7 @@
     const playing = autoplay !== undefined ? autoplay : !a.paused;
     if (idx === State.idx && a.src) {
       try { a.currentTime = time; } catch (e) { /* ignore */ }
-      if (playing) a.play().catch(() => {});
+      if (playing) requestPlay(a);
       updateTransport();
       highlight(idx);
       if (wasAwaiting) renderDock();
@@ -795,10 +912,18 @@
   }
 
   function stopPlayback() {
-    if (State.audio) { State.audio.pause(); State.audio.removeAttribute('src'); State.audio.load(); }
+    State.loadSeq++;   // anything still reading from IndexedDB is now stale
+    if (State.audio) {
+      State.audio.onloadedmetadata = null;
+      State.audio.pause();
+      State.audio.removeAttribute('src');
+      State.audio.load();
+    }
     if (State.objUrl) { URL.revokeObjectURL(State.objUrl); State.objUrl = null; }
+    releaseNext();
     clearTimeout(State.saveTimer); State.saveTimer = 0;
     State.awaitingChunk = false;
+    State.blocked = false;
   }
 
   /* ── Lock-screen / headset controls ────────────────────────────────────── */
